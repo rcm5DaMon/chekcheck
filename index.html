@@ -3,29 +3,35 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Sales Time Check</title>
+  <title>Sales Location & Time Check</title>
   <style>
+    :root { color-scheme: light dark; }
     body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
     .card { max-width: 760px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 12px; }
     h2 { margin-top: 0; }
     label { display:block; margin: 12px 0 6px; font-weight: 600; }
-    input, button { padding: 10px; width: 100%; box-sizing: border-box; }
+    input, select, button { padding: 10px; width: 100%; box-sizing: border-box; }
     input[disabled] { background: rgba(127,127,127,.08); }
     button { cursor: pointer; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .ok { color: #0a7b22; font-weight: 700; }
+    .warn { color: #b45309; font-weight: 700; }
     .err { color: #b91c1c; font-weight: 700; }
     .muted { color: #666; font-size: 0.92rem; }
+    .badge { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius: 999px; margin-left:8px; font-size: 0.85rem; }
     .pill { display:inline-block; padding:6px 10px; border:1px solid #ddd; border-radius:999px; margin:6px 6px 0 0; cursor:pointer; user-select:none; }
-    .sugg-box { margin-top: 6px; }
-    .sugg-title { font-size:.85rem; color:#555; margin: 4px 0; }
+    .hidden { display:none; }
+    .hint { font-size: .85rem; color: #555; margin-top: 4px; }
+    .spinner { display:inline-block; width: 14px; height: 14px; border:2px solid #bbb; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; margin-right:6px;}
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>Sales Time Check</h2>
-    <p class="muted">Enter your name and dealer to check recorded time spent.</p>
+    <h2>Sales Location & Time Check</h2>
+    <p class="muted">Input your name and select dealer to check your time spent at the dealer.</p>
 
-    <!-- Sales Name -->
+    <!-- Sales Name with datalist + pills -->
     <label for="salesNameInput">Sales Name</label>
     <input id="salesNameInput" type="text" placeholder="Type sales name..." list="salesNameList" autocomplete="off" />
     <datalist id="salesNameList"></datalist>
@@ -35,184 +41,255 @@
     </div>
 
     <!-- Dealer Name -->
-    <label for="dealerInput">Dealer Name</label>
+    <label for="dealerInput">Search dealer by name</label>
     <input id="dealerInput" type="text" placeholder="Type dealer name…" autocomplete="off" />
     <div class="sugg-box">
       <div class="sugg-title">Matched Dealers</div>
       <div id="dealerSuggestions"></div>
     </div>
+    <div class="hint" id="dealerHint" aria-live="polite"></div>
+
+    <!-- Dealer Coordinates -->
+    <div class="row" style="margin-top:8px;">
+      <div>
+        <label>Dealer Coordinates</label>
+        <input id="dealerCoords" type="text" disabled placeholder="—" />
+      </div>
+    </div>
 
     <!-- Status -->
-    <div style="margin-top:12px;">
-      <label>Status</label>
-      <input id="status" type="text" disabled placeholder="—" />
+    <div class="row">
+      <div>
+        <label>Status</label>
+        <input id="status" type="text" disabled placeholder="—" />
+      </div>
     </div>
 
-    <!-- Actions -->
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px;">
-      <button id="checkTime">Check Time</button>
+      <button id="reload">Reload Dealer List</button>
       <button id="goCheckout" disabled>Go to Checkout</button>
     </div>
+
+    <div style="margin-top:8px;">
+      <span id="radiusInfo" class="badge"></span>
+      <span id="accInfo" class="badge hidden"></span>
+    </div>
+
+    <p class="muted" style="margin-top:12px;">
+      Tip: Allow location permission and use a phone outdoors for better accuracy.
+    </p>
   </div>
 
   <script>
-    // ================= Utilities =================
+    // ============== Utilities ==============
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // CSV parser: handles quotes, commas, CRLF
     function parseCSV(text) {
-      return text.split("\n").map(r => r.split(","));
+      const rows = [];
+      let row = [], cell = '', inQuotes = false;
+
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i], n = text[i + 1];
+        if (inQuotes) {
+          if (c === '"' && n === '"') { cell += '"'; i++; }
+          else if (c === '"') { inQuotes = false; }
+          else { cell += c; }
+        } else {
+          if (c === '"') { inQuotes = true; }
+          else if (c === ',') { row.push(cell); cell = ''; }
+          else if (c === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+          else if (c === '\r') { /* ignore CR */ }
+          else { cell += c; }
+        }
+      }
+      if (cell.length || row.length) { row.push(cell); rows.push(row); }
+      return rows;
     }
+
     function stripQuotesTrim(s) {
       return String(s ?? '').replace(/^"+|"+$/g, '').trim();
     }
-    function normalizeKey(s) {
-      return String(s ?? "")
-        .toLowerCase()
-        .replace(/\u00a0/g, " ")
-        .replace(/\s+/g, "")
-        .trim();
+
+    function normalizeHeaders(arr) {
+      return arr.map(h => stripQuotesTrim(h).toLowerCase());
     }
-    function escJS(s) {
-      return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    }
+
     function uniqueSorted(arr) {
       return [...new Set(arr)].sort((a,b)=>a.localeCompare(b));
     }
 
-    // ================= Config =================
-    const CSV_URL_DEALERS = "YOUR_DEALERS_SHEET_CSV_URL";
-    const CSV_URL_SALESMEN = "YOUR_SALESMEN_SHEET_CSV_URL";
-    const SHEET_URL_TIME = "YOUR_TIME_SHEET_CSV_URL";
-    const MIN_TIME_MINUTES = 15;
+    function escJS(s) {
+      return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    }
 
-    // ================= DOM =================
+    // ============== State & DOM ==============
     const salesNameInput = document.getElementById("salesNameInput");
     const salesNameList = document.getElementById("salesNameList");
     const salesNameSuggestions = document.getElementById("salesNameSuggestions");
 
     const dealerInput = document.getElementById("dealerInput");
     const dealerSuggestions = document.getElementById("dealerSuggestions");
+    const dealerHint = document.getElementById("dealerHint");
 
+    const dealerCoords = document.getElementById("dealerCoords");
     const statusEl = document.getElementById("status");
-    const checkTimeBtn = document.getElementById("checkTime");
-    const goCheckoutBtn = document.getElementById("goCheckout");
 
-    // ================= State =================
+    const reloadBtn = document.getElementById("reload");
+    const goCheckoutBtn = document.getElementById("goCheckout");
+    const radiusInfo = document.getElementById("radiusInfo");
+    const accInfo = document.getElementById("accInfo");
+
+    const CSV_URL_DEALERS = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS3Hpp6N8pjYkRMy-Pi58yCxZB5o-rCdQfnBv0Z_vHMq6Uii5uxG60BnpQVcsyDTg-X9-A-HPodXhpT/pub?output=csv";
+    const CSV_URL_SALESMEN = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTiHz0jejmmecSnTe5uK3Kwt_kx7HYcvMwRRQ_OeS1TA4evqMUwl8srVUe164DbJnxjYcuKuUsHQiFm/pub?gid=472318377&single=true&output=csv";
+
     let DEALERS = [];
     let SALESPEOPLE = [];
     let SELECTED_DEALER = null;
     let SALES_NAME = "";
 
-    // ================= Load Salespeople =================
-    async function loadSalespeople() {
+    // ============== Load Dealers ==============
+    async function loadDealers() {
+      dealerSuggestions.innerHTML = `<span class="spinner"></span><span class="muted">Loading dealers…</span>`;
+      dealerHint.textContent = "";
       try {
-        const res = await fetch(CSV_URL_SALESMEN, { cache: "no-store" });
+        const res = await fetch(CSV_URL_DEALERS, { cache: "no-store" });
+        if (!res.ok) throw new Error("Cannot fetch dealer CSV");
         const text = await res.text();
         const rows = parseCSV(text);
-        rows.shift(); // remove header
-        SALESPEOPLE = uniqueSorted(rows.map(r => stripQuotesTrim(r[0])).filter(Boolean));
-        salesNameList.innerHTML = SALESPEOPLE.map(n => `<option value="${n}">`).join("");
-        renderSalesSuggestions("");
+        if (!rows.length) throw new Error("Empty dealer CSV");
+
+        const header = normalizeHeaders(rows.shift());
+        const iName = header.findIndex(h => ["dealername","dealer name","name","dealer"].includes(h));
+        const iLat  = header.findIndex(h => ["latitude","lat"].includes(h));
+        const iLng  = header.findIndex(h => ["longitude","lng","lon","long"].includes(h));
+        if (iName < 0 || iLat < 0 || iLng < 0) throw new Error("CSV header must include DealerName, Latitude, Longitude");
+
+        DEALERS = rows.map(r => ({
+          name: stripQuotesTrim(r[iName]),
+          lat: parseFloat(stripQuotesTrim(r[iLat])),
+          lng: parseFloat(stripQuotesTrim(r[iLng]))
+        })).filter(d => d.name && Number.isFinite(d.lat) && Number.isFinite(d.lng));
+
+        dealerSuggestions.innerHTML = `<span class="muted">${DEALERS.length} dealers loaded. Start typing to filter.</span>`;
       } catch (e) {
-        console.error("Salespeople load error:", e.message);
+        dealerSuggestions.innerHTML = `<span class="err">Error: ${e.message}</span>`;
       }
     }
 
+    // ============== Load Salespeople ==============
+    async function loadSalespeople() {
+      try {
+        const res = await fetch(CSV_URL_SALESMEN, { cache: "no-store" });
+        if (!res.ok) throw new Error("Cannot fetch salespeople CSV");
+        const text = await res.text();
+        const rows = parseCSV(text);
+        if (!rows.length) throw new Error("Empty salespeople CSV");
+
+        const header = normalizeHeaders(rows.shift());
+        const iName = header.findIndex(h => ["sales name","sales_name","salesname","name"].includes(h));
+        if (iName < 0) throw new Error("CSV header must include 'Sales Name'");
+
+        SALESPEOPLE = uniqueSorted(rows.map(r => stripQuotesTrim(r[iName])).filter(Boolean));
+
+        // Populate datalist (native dropdown)
+        salesNameList.innerHTML = SALESPEOPLE.map(n => `<option value="${n}">`).join("");
+        renderSalesSuggestions("");
+      } catch (e) {
+        console.error("Error loading salespeople:", e.message);
+      }
+    }
+
+    loadDealers();
+    loadSalespeople();
+    reloadBtn.addEventListener("click", loadDealers);
+
+    // ============== Sales Name Suggestions ==============
     function renderSalesSuggestions(query) {
-      const q = String(query || "").toLowerCase();
+      const q = String(query || "").toLowerCase().trim();
       const list = (q ? SALESPEOPLE.filter(n => n.toLowerCase().includes(q)) : SALESPEOPLE).slice(0, 20);
       salesNameSuggestions.innerHTML = list.length
         ? list.map(n => `<div class="pill" onclick="selectSalesName('${escJS(n)}')">${n}</div>`).join("")
         : `<span class="muted">No matches.</span>`;
     }
 
-    window.selectSalesName = function(name) {
-      SALES_NAME = name;
-      salesNameInput.value = name;
-      renderSalesSuggestions(name);
-    };
-
     salesNameInput.addEventListener("input", e => renderSalesSuggestions(e.target.value));
     salesNameInput.addEventListener("focus", () => renderSalesSuggestions(salesNameInput.value));
 
-    // ================= Load Dealers =================
-    async function loadDealers() {
-      try {
-        const res = await fetch(CSV_URL_DEALERS, { cache: "no-store" });
-        const text = await res.text();
-        const rows = parseCSV(text);
-        rows.shift(); // remove header
-        DEALERS = rows.map(r => stripQuotesTrim(r[0])).filter(Boolean);
-      } catch (e) {
-        console.error("Dealer load error:", e.message);
-      }
-    }
-
-    function renderDealerSuggestions(query) {
-      const q = String(query || "").toLowerCase();
-      const list = (q ? DEALERS.filter(d => d.toLowerCase().includes(q)) : DEALERS).slice(0, 20);
-      dealerSuggestions.innerHTML = list.length
-        ? list.map(n => `<div class="pill" onclick="selectDealer('${escJS(n)}')">${n}</div>`).join("")
-        : `<span class="muted">No matches.</span>`;
-    }
-
-    window.selectDealer = function(name) {
-      SELECTED_DEALER = name;
-      dealerInput.value = name;
-      renderDealerSuggestions(name);
+    window.selectSalesName = function(name) {
+      SALES_NAME = name;
+      salesNameInput.value = name;
+      computeTimeSpent();
     };
 
-    dealerInput.addEventListener("input", e => renderDealerSuggestions(e.target.value));
-    dealerInput.addEventListener("focus", () => renderDealerSuggestions(dealerInput.value));
+    // ============== Dealer Suggestions ==============
+    const updateDealerSuggestions = debounce(() => {
+      const q = dealerInput.value.toLowerCase().trim();
+      const suggestions = (q ? DEALERS.filter(d => d.name.toLowerCase().includes(q)) : DEALERS).slice(0, 50);
+      dealerSuggestions.innerHTML = suggestions.length
+        ? suggestions.map(d => `<div class="pill" onclick="selectDealer('${escJS(d.name)}')">${d.name}</div>`).join("")
+        : `<span class="muted">No matches.</span>`;
+    }, 150);
 
-    // ================= Time Check =================
-    async function checkTimeSpent() {
-      if (!SALES_NAME || !SELECTED_DEALER) return { ok: false, minutes: 0 };
+    dealerInput.addEventListener("input", updateDealerSuggestions);
+    dealerInput.addEventListener("focus", updateDealerSuggestions);
 
-      const date = new Date();
-      const mm = date.getMonth() + 1;
-      const dd = date.getDate();
-      const yyyy = date.getFullYear();
-      const dateKey = `${mm}/${dd}/${yyyy}`;
+    window.selectDealer = function(dealerName) {
+      const selected = DEALERS.find(d => d.name === dealerName);
+      if (!selected) return;
+      SELECTED_DEALER = selected;
+      dealerInput.value = dealerName;
+      dealerCoords.value = `${selected.lat}, ${selected.lng}`;
+      computeTimeSpent();
+    };
 
-      const response = await fetch(SHEET_URL_TIME, { cache: "no-store" });
-      const text = await response.text();
-      const rows = parseCSV(text);
+    // ============== Time Check ==============
+    async function computeTimeSpent() {
+      if (!SELECTED_DEALER || !SALES_NAME) { updateGate(); return; }
 
-      const DATE_COL = 3, SALES_COL = 0, DEALER_COL = 2, TIME_COL = 10;
-
-      let found = null;
-      for (let row of rows) {
-        const rowKey = normalizeKey(`${row[DATE_COL]}${row[SALES_COL]}${row[DEALER_COL]}`);
-        const triggerKey = normalizeKey(`${dateKey}${SALES_NAME}${SELECTED_DEALER}`);
-        if (rowKey === triggerKey) { found = row; break; }
-      }
-
-      if (!found) return { ok: false, minutes: 0 };
-      const timeSpent = parseInt(stripQuotesTrim(found[TIME_COL]), 10);
-      return { ok: Number.isFinite(timeSpent) && timeSpent >= MIN_TIME_MINUTES, minutes: timeSpent || 0 };
+      // Directly check time spent at dealer
+      const isValidTime = await checkTimeSpent();
+      goCheckoutBtn.disabled = !isValidTime;
     }
 
-    // ================= UI Actions =================
-    checkTimeBtn.addEventListener("click", async () => {
-      statusEl.value = "Checking...";
-      const timeCheck = await checkTimeSpent();
-      if (timeCheck.ok) {
-        statusEl.value = `✅ Time ${timeCheck.minutes} min OK`;
-        statusEl.className = "ok";
-        goCheckoutBtn.disabled = false;
-      } else {
-        statusEl.value = `❌ Time ${timeCheck.minutes} min (<${MIN_TIME_MINUTES})`;
-        statusEl.className = "err";
-        goCheckoutBtn.disabled = true;
+    async function checkTimeSpent() {
+      if (!SELECTED_DEALER || !SALES_NAME) return false;
+
+      try {
+        const dealer = SELECTED_DEALER.name;
+        const date = new Date();
+        const y = date.getFullYear(), m = String(date.getMonth()+1).padStart(2,'0'), d = String(date.getDate()).padStart(2,'0');
+        const trigger = `${y}-${m}-${d}${SALES_NAME}${dealer}`;
+
+        const response = await fetch("your-time-csv-url", { cache: "no-store" });
+        if (!response.ok) throw new Error("Cannot fetch time CSV");
+        const text = await response.text();
+        const rows = parseCSV(text);
+
+        const TRIGGER_COL = 9, TIME_COL = 10; // adjust to your sheet
+        const match = rows.find(r => stripQuotesTrim(r[TRIGGER_COL]) === trigger);
+        if (!match) return false;
+
+        const timeSpent = parseInt(stripQuotesTrim(match[TIME_COL]), 10);
+        return Number.isFinite(timeSpent) && timeSpent >= 15;
+      } catch (e) {
+        console.error("Time check error:", e); 
+        return false;
       }
-    });
+    }
 
+    function updateGate() {
+      const needDealer = !SELECTED_DEALER;
+      if (needDealer)       { statusEl.value = "Select dealer"; }
+      statusEl.className = "";
+      goCheckoutBtn.disabled = true;
+    }
+
+    // ============== Checkout ==============
     goCheckoutBtn.addEventListener("click", () => {
-      window.location.href = "https://your-checkout-page.com";
+      if (goCheckoutBtn.disabled) return;
+      window.location.href = "https://your-checkout-page.com"; // TODO
     });
-
-    // ================= Init =================
-    loadSalespeople();
-    loadDealers();
   </script>
 </body>
 </html>
